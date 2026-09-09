@@ -1,76 +1,109 @@
+import json
 import os
-import anthropic 
-from dotenv import load_dotenv
 import subprocess
+
+from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
 
-client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
 
 def run_python_code(code):
-    with open("temp_script.py","w") as f:
+    with open("temp_script.py", "w", encoding="utf-8") as f:
         f.write(code)
 
     result = subprocess.run(
-        ["py","temp_script.py"],
+        ["python", "temp_script.py"],
         capture_output=True,
         text=True,
-        timeout=10
-    )    
+        timeout=10,
+    )
 
     if result.returncode == 0:
         return f"Success. output:\n{result.stdout}"
-    else:
-        return f"Error:\n{result.stderr}"
+    return f"Error:\n{result.stderr}"
+
 
 tools = [
     {
-        "name": "run_python_code",
-        "description": "Write and execute a python script.Returns the output if it ran successfully or the error message if it fails.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"code": {"type":"string", "description":"The full python code to execute."}},
-            "required": ["code"]
-        }
+        "type": "function",
+        "function": {
+            "name": "run_python_code",
+            "description": "Write and execute a Python script. Returns the output if it ran successfully or the error message if it fails.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "description": "The full Python code to execute.",
+                    }
+                },
+                "required": ["code"],
+            },
+        },
     }
 ]
 
+
 def run_agent(user_message):
-    messages = [{"role":"user", "content":user_message}]
+    messages = [{"role": "user", "content": user_message}]
+
     while True:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
+        response = client.chat.completions.create(
+            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             max_tokens=1024,
-            system="You are a coding agent. When you erite code, run it using run_python_code tool. If it errors, read the error carefully, fix the code and run it again."
-            "Keep trying until it succeeds or you're confident it's not fixable.",
+            temperature=0.2,
             tools=tools,
-            messages=messages
+            messages=messages,
         )
 
-        messages.append({"role": "assistant", "content": response.content})
+        assistant_message = response.choices[0].message
+        messages.append(
+            {
+                "role": "assistant",
+                "content": assistant_message.content or "",
+                "tool_calls": (
+                    [
+                        {
+                            "id": tool_call.id,
+                            "type": "function",
+                            "function": {
+                                "name": tool_call.function.name,
+                                "arguments": tool_call.function.arguments,
+                            },
+                        }
+                        for tool_call in assistant_message.tool_calls or []
+                    ]
+                    if assistant_message.tool_calls
+                    else None
+                ),
+            }
+        )
 
-        if response.stop_reason!= "tool_use":
-            for block in response.content:
-                if block.type=="text":
-                    print(block.text)
+        if not assistant_message.tool_calls:
+            if assistant_message.content:
+                print(assistant_message.content)
             return
 
-        tool_results = []
+        for tool_call in assistant_message.tool_calls:
+            if tool_call.function.name == "run_python_code":
+                arguments = json.loads(tool_call.function.arguments)
+                result = run_python_code(**arguments)
+            else:
+                result = f"Unknown tool: {tool_call.function.name}"
 
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "run_python_code":
-                    result = run_python_code(**block.input)
-
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(result)
-                })     
-
-        messages.append({"role": "user", "content": tool_results})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": str(result),
+                }
+            )
 
 
-if __name__=="__main__":
-    #run_agent("Write and run Python code that connects to a SQLite database file called 'inventory.db' and queries a table called 'products'. Just try it directly — don't add error handling preemptively.")
-    run_agent("Yes, proceed with option B.")
+if __name__ == "__main__":
+    run_agent(
+        "Write and run Python code that connects to a SQLite database file called 'inventory.db', creates a 'products' table if it doesn't exist, inserts sample rows, and queries it. If you hit an error, fix it and run again."
+    )
